@@ -9,6 +9,7 @@ $global:SysAidAPIPaths = @{
     AddServiceRequestLink = "sr/{0}/link"
     GetServiceRequest = "sr/{0}"
     UpdateServiceRequest = "sr/{0}"
+    GetServiceRecordTemplate = "sr/template"
     GetList = "list/{0}"
     GetAllLists = "list"
     AddServiceRequestAttachment = "sr/{0}/attachment"
@@ -35,7 +36,6 @@ function Get-FileContentType{
         return $Default
     }
 }
-
 
 function Get-SysAidErrorMessage{
     [CmdletBinding()]
@@ -70,6 +70,7 @@ function Get-SysAidErrorMessage{
 
     return $message
 }
+
 function Get-SysAidAPIWebSession{
     [CmdletBinding()]
     param (
@@ -153,6 +154,7 @@ function Get-SysAidUsers{
         return $response.Content | ConvertFrom-Json
     }
 }
+
 function New-SysAidServiceRequestNote{
     [CmdletBinding()]
     param (
@@ -217,7 +219,10 @@ function New-SysAidServiceRecordPayload{
         [int]$AssignedUser,
 
         [Parameter(Mandatory=$False)]
-        [object[]]$Notes
+        [object[]]$Notes,
+
+        [Parameter(Mandatory=$False)]
+        [System.Collections.Hashtable]$Custom
     )
 
     $payloadKeyValues = [System.Collections.ArrayList]::new()
@@ -264,7 +269,7 @@ function New-SysAidServiceRecordPayload{
     if($DueDate){
         $payloadKeyValues.Add([PSCustomObject]@{
             key = "due_date"
-            value = ConvertTo-UnixEpochTime $DueDate
+            value = (ConvertTo-UnixEpochTime $DueDate).ToString()
         }) | Out-Null
     }
 
@@ -291,6 +296,16 @@ function New-SysAidServiceRecordPayload{
         }) | Out-Null
     }
 
+    # Add any custom fields not covered by default parameters
+    if($Custom){
+        $Custom.GetEnumerator() | ForEach-Object{
+            $payloadKeyValues.Add([PSCustomObject]@{
+                key = $_.Key
+                value = $_.value.ToString()
+            }) | Out-Null
+        }
+    }
+
     # Payload as an object converted to JSON
     $serviceRecordDetails = @{
         info = $payloadKeyValues
@@ -303,6 +318,62 @@ function New-SysAidServiceRecordPayload{
 
     return [PSCustomObject]$serviceRecordDetails | ConvertTo-Json -Depth 5
 } 
+
+function Get-SysaidServiceRecordTemplate{
+    [CmdletBinding()]
+    param (
+        [Parameter(Position=0, Mandatory=$true)]
+        [string]$TenantURL,
+
+        [Parameter(Position=1, Mandatory=$true)]
+        [Alias("Session")]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
+
+        [Parameter(Mandatory=$false)]
+        [string]$View="",
+
+        [Parameter(Mandatory=$false)]
+        [string[]]$Fields=@(),
+
+        [Parameter(Mandatory=$false)]
+        [int]$Template=-1,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Incident","Request","Problem","Change")]
+        [string]$Type="Incident"
+    )
+
+    # Build the URI string for creating a new Service Request
+    $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
+    $queryParameters.Add("type",$Type.ToLower())
+    if($view){$queryParameters.Add("view",$View)}
+    if($Fields){$queryParameters.Add("fields",$Fields)}
+    if($Template -gt 0){$queryParameters.Add("template",$Template)}
+
+    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.GetServiceRecordTemplate)
+    $completeURI.Query = $queryParameters.ToString()
+
+    # Prepare the splatting variable
+    $invokeWebRequestNewServiceRecordsParameters = @{
+        URI = $completeURI.Uri.AbsoluteUri
+        Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
+        ContentType = "application/json"
+        ErrorVariable = "invokeWebRequestError"
+        WebSession = $WebSession
+        Body = $Payload
+    }
+
+    try{
+        $response = $null
+        $response = Invoke-RestMethod @invokeWebRequestNewServiceRecordsParameters
+    } catch [InvalidOperationException]{
+        if ($invokeWebRequestError){
+            Write-Error (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0] -URL $invokeWebRequestNewServiceRecordsParameters.URI -RequestBody $invokeWebRequestNewServiceRecordsParameters.Body )
+        }
+    }
+
+    return $response
+}
 function Get-SysaidServiceRecord{
     [CmdletBinding()]
     param (
