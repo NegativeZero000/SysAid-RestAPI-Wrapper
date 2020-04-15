@@ -103,8 +103,8 @@ function Get-SysAidAPIWebSession{
     return $session
 }
 
-function Get-SysAidUsers{
-    [CmdletBinding(DefaultParameterSetName="All")]
+function Get-SysAidUser{
+    [CmdletBinding(DefaultParameterSetName="Some")]
     param (
         [Parameter(Position=0, Mandatory=$true)]
         [string]$TenantURL,
@@ -113,45 +113,78 @@ function Get-SysAidUsers{
         [Alias("Session")]
         [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
 
+        [Parameter(Mandatory=$false)]
+        [string]$View,
+
+        [Parameter(Mandatory=$false)]
+        [string[]]$Fields=@(),
+
+        [Parameter(Mandatory=$false)]
+        [int]$Offset=0,
+
+        [Parameter( Mandatory=$false)]
+        [ValidateRange(1,500)]
+        [int]$Limit=500,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Admin","User","Manager")]
+        [string]$Type="User",
+
         [Parameter(ParameterSetName="All")]
         [switch]$All=$false,
 
-        [Parameter(ParameterSetName="ID")]
+        [Parameter(ParameterSetName="ID", Mandatory=$true)]
         [int]$ID
     )
-    
-    $invokeWebRequestGetUserParameters = @{
+
+    # Build the query string using the supplied parameters where applicable
+    $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
+    if($Type){$queryParameters.Add("type",$Type.ToLower())}
+    if($View){$queryParameters.Add("view",$View)}
+    if($Fields){$queryParameters.Add("fields",$Fields -join ",")}
+    if($Offset){$queryParameters.Add("offset",$Offset)}
+    if($Limit){$queryParameters.Add("limit",$Limit)}
+
+    # Set the URI based on the parameter set
+    Switch($pscmdlet.ParameterSetName){
+        "ID"{$completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.Users -f $ID))}
+        default{$completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.Users)}
+    }
+    $completeURI.Query = $queryParameters.ToString()
+
+    $invokeRestMethodGetUserParameters = @{
+        URI = $completeURI.Uri.AbsoluteUri
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
-        ErrorVariable = "invokeWebRequestError"
+        ErrorVariable = "invokeRestMethodError"
         WebSession = $WebSession
     }
-    Switch($pscmdlet.ParameterSetName){
-        "All"{
-            try{
-                $invokeWebRequestGetUserParameters.URI = $TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.Users
-                $response = Invoke-WebRequest @invokeWebRequestGetUserParameters
-            } catch [InvalidOperationException]{
-                if ($invokeWebRequestError){
-                    throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
-                }
-            }
-        }
-        "ID"{
-            try{
-                $invokeWebRequestGetUserParameters.URI = $TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.Users -f $ID)
-                $response = Invoke-WebRequest @invokeWebRequestGetUserParameters
-            } catch [InvalidOperationException]{
-                if ($invokeWebRequestError){
-                    throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
-                }
-            }
+
+    # Execute the request
+    try{
+        $response = Invoke-RestMethod @invokeRestMethodGetUserParameters
+    } catch [InvalidOperationException]{
+        if ($invokeRestMethodError){
+            throw (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0])
         }
     }
 
+    # Return the results, if any, and call again if we suspect there is more
     if($response){
-        write-warning "This will return max 500 users currently"
-        return $response.Content | ConvertFrom-Json
+        if($response.count -eq $Limit -and $pscmdlet.ParameterSetName -eq "All"){
+            $getSysAidUserParameters = @{
+                TenantURL = $TenantURL
+                WebSession = $WebSession
+                View = $View
+                Fields = $Fields
+                Offset = $Offset + $Limit
+                Limit = $Limit
+                Type = $Type
+                All = $true
+            }
+            Get-SysAidUser @getSysAidUserParameters 
+        }
+        return $response
     }
 }
 
@@ -260,7 +293,7 @@ function New-SysAidServiceRecordPayload{
     # Description
     if($Description){
         $payloadKeyValues.Add([PSCustomObject]@{
-            key = "Description"
+            key = "description"
             value = $Description
         }) | Out-Null
     }
@@ -410,6 +443,7 @@ function Get-SysaidServiceRecord{
 
     return $response | ConvertFrom-Json
 }
+
 function New-SysAidServiceRecord{
     [CmdletBinding()]
     param (
@@ -448,21 +482,20 @@ function New-SysAidServiceRecord{
     $completeURI.Query = $queryParameters.ToString()
 
     # Prepare the splatting variable
-    $invokeWebRequestNewServiceRecordsParameters = @{
+    $invokeRestMethodNewServiceRecordsParameters = @{
         URI = $completeURI.Uri.AbsoluteUri
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Post
         ContentType = "application/json"
-        ErrorVariable = "invokeWebRequestError"
+        ErrorVariable = "invokeRestMethodError"
         WebSession = $WebSession
         Body = $Payload
     }
 
     try{
-        $response = $null
-        $response = Invoke-WebRequest @invokeWebRequestNewServiceRecordsParameters
+        $response = Invoke-RestMethod @invokeRestMethodNewServiceRecordsParameters
     } catch [InvalidOperationException]{
-        if ($invokeWebRequestError){
-            Write-Error (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0] -URL $invokeWebRequestNewServiceRecordsParameters.URI -RequestBody $invokeWebRequestNewServiceRecordsParameters.Body )
+        if ($invokeRestMethodError){
+            Write-Error (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0] -URL $invokeRestMethodNewServiceRecordsParameters.URI -RequestBody $invokeRestMethodNewServiceRecordsParameters.Body )
         }
     }
 
@@ -641,7 +674,7 @@ function Search-SysAidUser{
 }
 
 function Get-SysAidList{
-    [CmdletBinding(DefaultParameterSetName="All")]
+    [CmdletBinding(DefaultParameterSetName="ID")]
     param (
         [Parameter(Position=0, Mandatory=$true)]
         [string]$TenantURL,
@@ -667,7 +700,7 @@ function Get-SysAidList{
         [switch]$All,
 
         [Parameter(Mandatory=$True, ParameterSetName="ID")]
-        [int]$ID
+        [string]$ID
     )
 
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
@@ -701,30 +734,6 @@ function Get-SysAidList{
     }
 
     return $response.Content | ConvertFrom-Json
-}
-
-function ConvertTo-MultipartFormDataContent{
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [System.IO.FileInfo]$File
-    )
-
-    $multipartContent = [System.Net.Http.MultipartFormDataContent]::new()
-
-    $fileStream = [System.IO.FileStream]::new($File.FullName, [System.IO.FileMode]::Open)
-    
-    $fileHeader = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new("form-data")
-    $fileHeader.Name = "file"
-    $fileHeader.FileName = $File.FullName
-
-    $fileContent = [System.Net.Http.StreamContent]::new($fileStream)
-    $fileContent.Headers.ContentDisposition = $fileHeader
-
-    $multipartContent.Add($fileContent)
-
-    $FileStream.Close()
-    return $multipartContent
 }
 
 function Add-SysAidServiceRequestAttachment{
@@ -818,8 +827,10 @@ function Add-SysAidServiceRequestAttachment{
 
                 throw [System.Net.Http.HttpRequestException] $errorMessage
             }
-
-            return $response.Content.ReadAsStringAsync().Result
+            
+            if($response.Content.ReadAsStringAsync().Result){
+                return $response.Content.ReadAsStringAsync().Result
+            }
         }
         catch [Exception]{
             $PSCmdlet.ThrowTerminatingError($_)
@@ -829,6 +840,6 @@ function Add-SysAidServiceRequestAttachment{
             if($response){$response.Dispose()}
         }
     }
-    end {$packageFileStream.Dispose()}
+    end {if($packageFileStream){$packageFileStream.Dispose()}}
 }
 
