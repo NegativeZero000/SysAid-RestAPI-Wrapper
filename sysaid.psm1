@@ -251,6 +251,9 @@ function New-SysAidServiceRecordPayload{
         [Parameter(Mandatory=$False)]
         [int]$AssignedUser,
 
+        [Parameter(Mandatory=$false)]
+        [bool]$Archive,
+
         [Parameter(Mandatory=$False)]
         [object[]]$Notes,
 
@@ -329,12 +332,20 @@ function New-SysAidServiceRecordPayload{
         }) | Out-Null
     }
 
+    # Build the notes array
+    if($Archive){
+        $payloadKeyValues.Add([PSCustomObject]@{
+            key = "archive"
+            value = "$([int]$Archive)"
+        }) | Out-Null
+    }
+
     # Add any custom fields not covered by default parameters
     if($Custom){
         $Custom.GetEnumerator() | ForEach-Object{
             $payloadKeyValues.Add([PSCustomObject]@{
                 key = $_.Key
-                value = $_.value.ToString()
+                value = [string]$_.value
             }) | Out-Null
         }
     }
@@ -563,25 +574,23 @@ function Set-SysAidServiceRecord{
     )
 
     $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.UpdateServiceRequest -f $ID))
-    Write-Verbose "[Set-SysAidServiceRecord]URL: $($completeURI.Uri.AbsoluteUri)"
-    Write-Verbose "[Set-SysAidServiceRecord]Reqeust Body: $Payload"
 
     # Prepare the splatting variable
-    $invokeWebRequestNewServiceRecordsParameters = @{
+    $invokeRestMethodSetServiceRecordsParameters = @{
         URI = $completeURI.Uri.AbsoluteUri
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Put
         ContentType = "application/json"
-        ErrorVariable = "invokeWebRequestError"
+        ErrorVariable = "invokeRestMethodError"
         WebSession = $WebSession
         Body = $Payload
     }
 
     try{
         $response = $null
-        $response = Invoke-WebRequest @invokeWebRequestNewServiceRecordsParameters
+        $response = Invoke-RestMethod @invokeRestMethodSetServiceRecordsParameters
     } catch [InvalidOperationException]{
-        if ($invokeWebRequestError){
-            throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
+        if ($invokeRestMethodError){
+            throw (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0])
         }
     }
 
