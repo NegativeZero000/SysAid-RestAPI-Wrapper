@@ -1,4 +1,4 @@
-$global:SysAidAPIPaths = @{
+$script:SysAidAPIPaths = @{
     root = "api/v1/"
     Users = "users"
     SpecificUser = "users/{0}"
@@ -7,6 +7,7 @@ $global:SysAidAPIPaths = @{
     NewServiceRequest = "sr"
     CloseServiceRequest = "sr/{0}/close"
     AddServiceRequestLink = "sr/{0}/link"
+    GetServiceRequestList = "sr"
     GetServiceRequest = "sr/{0}"
     UpdateServiceRequest = "sr/{0}"
     GetServiceRecordTemplate = "sr/template"
@@ -15,9 +16,25 @@ $global:SysAidAPIPaths = @{
     AddServiceRequestAttachment = "sr/{0}/attachment"
 }
 
-$global:SysAidAPIErrors = @{
+$script:SysAidAPIErrors = @{
     ServiceRequestAlreadyClosed = "This service record is already closed."
-}   
+}
+
+function ConvertTo-SysAidFriendlyText{
+    # There are several characters that will be rejected by the API and trigger HTML 500 Errors
+    # This function will address those
+    param($string)
+    # return ($string -replace [char]0xA0 -replace [char]0x2013, "-")
+    if($string){return [Text.Encoding]::ASCII.GetString([Text.Encoding]::GetEncoding("Cyrillic").GetBytes($string))}
+}
+
+function Get-SysAidTenantURL{
+    return $script:sysAidTenantURL
+}
+
+function Get-SysAidWebSession{
+    return $script:sysAidWebSession
+}
 
 function Get-FileContentType{
     [CmdletBinding()]
@@ -71,7 +88,7 @@ function Get-SysAidErrorMessage{
     return $message
 }
 
-function Get-SysAidAPIWebSession{
+function Set-SysAidAPIWebSession{
     [CmdletBinding()]
     param (
         [Parameter(Position=0, Mandatory=$true)]
@@ -100,19 +117,13 @@ function Get-SysAidAPIWebSession{
         throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
     }
     
-    return $session
+    $script:sysAidWebSession = $session
+    $script:sysAidTenantURL = $tenantURL
 }
 
 function Get-SysAidUser{
     [CmdletBinding(DefaultParameterSetName="Some")]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
-
         [Parameter(Mandatory=$false)]
         [string]$View,
 
@@ -137,6 +148,8 @@ function Get-SysAidUser{
         [int]$ID
     )
 
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+
     # Build the query string using the supplied parameters where applicable
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
     if($Type){$queryParameters.Add("type",$Type.ToLower())}
@@ -147,8 +160,8 @@ function Get-SysAidUser{
 
     # Set the URI based on the parameter set
     Switch($pscmdlet.ParameterSetName){
-        "ID"{$completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.Users -f $ID))}
-        default{$completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.Users)}
+        "ID"{$completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.SpecificUser -f $ID))}
+        default{$completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.Users)}
     }
     $completeURI.Query = $queryParameters.ToString()
 
@@ -157,7 +170,7 @@ function Get-SysAidUser{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
         ErrorVariable = "invokeRestMethodError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
     }
 
     # Execute the request
@@ -173,8 +186,6 @@ function Get-SysAidUser{
     if($response){
         if($response.count -eq $Limit -and $pscmdlet.ParameterSetName -eq "All"){
             $getSysAidUserParameters = @{
-                TenantURL = $TenantURL
-                WebSession = $WebSession
                 View = $View
                 Fields = $Fields
                 Offset = $Offset + $Limit
@@ -195,16 +206,18 @@ function New-SysAidServiceRequestNote{
         [string]$SubmitUserName,
 
         [Parameter(Mandatory=$False)]
-        [datetime]$CreateDate,
+        [datetime]$CreateDate = (Get-Date),
 
         [Parameter(Mandatory=$False)]
-        [string]$Text
+        [string]$Text = ""
     )
 
     return [PSCustomObject]@{
         userName = $SubmitUserName
         createDate = ConvertTo-UnixEpochTime $CreateDate
-        text = $Text
+        # Remove any non-breaking spaces from the text
+        # Replace emdash with regular dash
+        text = ConvertTo-SysAidFriendlyText $Text
     }
 }
 
@@ -258,6 +271,9 @@ function New-SysAidServiceRecordPayload{
         [object[]]$Notes,
 
         [Parameter(Mandatory=$False)]
+        [int]$AssignedGroup,
+
+        [Parameter(Mandatory=$False)]
         [System.Collections.Hashtable]$Custom
     )
 
@@ -289,7 +305,7 @@ function New-SysAidServiceRecordPayload{
     if($Title){
         $payloadKeyValues.Add([PSCustomObject]@{
             key = "title"
-            value = $Title
+            value = ConvertTo-SysAidFriendlyText $Title
         }) | Out-Null
     }
 
@@ -297,7 +313,7 @@ function New-SysAidServiceRecordPayload{
     if($Description){
         $payloadKeyValues.Add([PSCustomObject]@{
             key = "description"
-            value = $Description
+            value = ConvertTo-SysAidFriendlyText $Description
         }) | Out-Null
     }
 
@@ -340,6 +356,14 @@ function New-SysAidServiceRecordPayload{
         }) | Out-Null
     }
 
+    # Assigned group
+    if($AssignedGroup){
+        $payloadKeyValues.Add([PSCustomObject]@{
+            key = "assigned_group"
+            value = "$AssignedGroup"
+        }) | Out-Null
+    }
+    
     # Add any custom fields not covered by default parameters
     if($Custom){
         $Custom.GetEnumerator() | ForEach-Object{
@@ -366,13 +390,6 @@ function New-SysAidServiceRecordPayload{
 function Get-SysaidServiceRecordTemplate{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
-
         [Parameter(Mandatory=$false)]
         [string]$View="",
 
@@ -387,6 +404,8 @@ function Get-SysaidServiceRecordTemplate{
         [string]$Type="Incident"
     )
 
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+
     # Build the URI string for creating a new Service Request
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
     $queryParameters.Add("type",$Type.ToLower())
@@ -394,7 +413,7 @@ function Get-SysaidServiceRecordTemplate{
     if($Fields){$queryParameters.Add("fields",$Fields)}
     if($Template -gt 0){$queryParameters.Add("template",$Template)}
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.GetServiceRecordTemplate)
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.GetServiceRecordTemplate)
     $completeURI.Query = $queryParameters.ToString()
 
     # Prepare the splatting variable
@@ -403,7 +422,7 @@ function Get-SysaidServiceRecordTemplate{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
         ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
         Body = $Payload
     }
 
@@ -418,53 +437,150 @@ function Get-SysaidServiceRecordTemplate{
 
     return $response
 }
-function Get-SysaidServiceRecord{
+
+function Get-SysaidServiceRecordList{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
+        [Parameter(Mandatory=$false)]
+        [string]$View,
 
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
+        [Parameter(Mandatory=$false)]
+        [string[]]$Fields=@(),
 
-        [Parameter(Mandatory=$True)]
-        [int]$ID
+        [Parameter(Mandatory=$false)]
+        [int]$Offset=0,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1,500)]
+        [int]$Limit=100,
+
+        [Parameter(Mandatory=$false)]
+        [string[]]$Sort,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Asc","Desc")]
+        [string]$SortOrder="Asc",
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet("Incident","Request","Problem","Change","All")]
+        [string]$Type="All",
+
+        [Parameter(Mandatory=$False)]
+        [int[]]$ID
     )
+    
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.GetServiceRequest -f $ID))
+    # Build the URI string for creating a new Service Request
+    $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
+    $queryParameters.Add("type",$Type.ToLower())
+    if($view){$queryParameters.Add("view",$View)}
+    if($Fields){$queryParameters.Add("fields",($Fields -join ","))}
+    if($Offset){$queryParameters.Add("offset",$Offset)}
+    if($Limit){$queryParameters.Add("limit",$Limit)}
+    if($Sort){
+        $queryParameters.Add("sort",($Sort -join ","))
+        $queryParameters.Add("dir",$SortOrder.ToLower())
+    }
+    if($ID){$queryParameters.Add("ids",($ID -join ","))}
+    
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.GetServiceRequestList)
+    $completeURI.Query = $queryParameters.ToString()
+
+        #if($ID.Count -gt 1){Write-Warning "Multiple ID's supplied for a single ID query. Only first ID will be used"}
+        #$completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.GetServiceRequest -f $ID[0]))
+    
 
     # Prepare the splatting variable
-    $invokeWebRequestNewServiceRecordsParameters = @{
+    $invokeRestMethodGetServiceRecordsListParameters = @{
         URI = $completeURI.Uri.AbsoluteUri
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
-        ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        ErrorVariable = "invokeRestMethodError"
+        WebSession = $script:sysAidWebSession 
     }
 
     try{
         $response = $null
-        $response = Invoke-WebRequest @invokeWebRequestNewServiceRecordsParameters
+        $response = Invoke-RestMethod @invokeRestMethodGetServiceRecordsListParameters
     } catch [InvalidOperationException]{
-        if ($invokeWebRequestError){
-            throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
+        if ($invokeRestMethodError){
+            throw (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0])
         }
     }
 
-    return $response | ConvertFrom-Json
+    return $response
+}
+
+function ConvertFrom-SysAidObject{
+    [CmdletBinding()]
+    param(
+        [parameter(Mandatory=$true,ValueFromPipeline=$true)]
+        [object[]]$Object
+    )
+
+    process{
+        foreach ($singleObject in $Object){
+            foreach($infoTable in $singleObject.info){
+                Add-Member -InputObject $singleObject -MemberType NoteProperty -Name $infoTable.key -Value ([PSCustomObject]$infoTable)
+            }
+            $singleObject
+        }
+    }
+}
+
+function Get-SysaidServiceRecord{
+    [CmdletBinding()]
+    param (
+
+        [Parameter(Mandatory=$True, ValueFromPipeline=$true)]
+        [int]$ID,
+
+        [Parameter(Mandatory=$false)]
+        [string]$View,
+
+        [Parameter(Mandatory=$false)]
+        [string[]]$Fields=@()
+    )
+
+    begin{
+        if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+    
+        # Build the URI string for creating a new Service Request
+        $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
+        if($view){$queryParameters.Add("view",$View)}
+        if($Fields){$queryParameters.Add("fields",($Fields -join ","))}
+    }
+
+    process{
+        $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.GetServiceRequest -f $ID)
+        $completeURI.Query = $queryParameters.ToString()
+    
+        # Prepare the splatting variable
+        $invokeRestMethodGetServiceRecordParameters = @{
+            URI = $completeURI.Uri.AbsoluteUri
+            Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
+            ContentType = "application/json"
+            ErrorVariable = "invokeRestMethodError"
+            WebSession = $script:sysAidWebSession 
+        }
+    
+        try{
+            $response = $null
+            $response = Invoke-RestMethod @invokeRestMethodGetServiceRecordParameters
+        } catch [InvalidOperationException]{
+            if ($invokeRestMethodError){
+                throw (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0])
+            }
+        }
+    
+        return $response
+    }
 }
 
 function New-SysAidServiceRecord{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
-
         [Parameter(Mandatory=$false)]
         [string]$View="",
 
@@ -481,6 +597,7 @@ function New-SysAidServiceRecord{
         [Parameter(Mandatory=$True)]
         [string]$Payload
     )
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
 
     # Build the URI string for creating a new Service Request
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
@@ -489,7 +606,7 @@ function New-SysAidServiceRecord{
     if($Fields){$queryParameters.Add("fields",$Fields)}
     if($Template -gt 0){$queryParameters.Add("template",$Template)}
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.NewServiceRequest)
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.NewServiceRequest)
     $completeURI.Query = $queryParameters.ToString()
 
     # Prepare the splatting variable
@@ -498,7 +615,7 @@ function New-SysAidServiceRecord{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Post
         ContentType = "application/json"
         ErrorVariable = "invokeRestMethodError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
         Body = $Payload
     }
 
@@ -516,13 +633,6 @@ function New-SysAidServiceRecord{
 function Close-SysAidServiceRecord{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
-
         [Parameter(Mandatory=$True)]
         [int]$ID,
 
@@ -530,7 +640,9 @@ function Close-SysAidServiceRecord{
         [string]$Solution
     )
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.CloseServiceRequest -f $ID))
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.CloseServiceRequest -f $ID))
 
     # Prepare the splatting variable
     $invokeWebRequestCloseServiceRecordsParameters = @{
@@ -538,7 +650,7 @@ function Close-SysAidServiceRecord{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Put
         ContentType = "application/json"
         ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
         Body = [pscustomobject]@{Solution=$Solution} | ConvertTo-Json
     }
 
@@ -556,16 +668,9 @@ function Close-SysAidServiceRecord{
     return $response
 }
 
-function Set-SysAidServiceRecord{
+function Update-SysAidServiceRecord{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
-
         [Parameter(Mandatory=$True)]
         [int]$ID,
 
@@ -573,7 +678,9 @@ function Set-SysAidServiceRecord{
         [string]$Payload
     )
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.UpdateServiceRequest -f $ID))
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.UpdateServiceRequest -f $ID))
 
     # Prepare the splatting variable
     $invokeRestMethodSetServiceRecordsParameters = @{
@@ -581,7 +688,7 @@ function Set-SysAidServiceRecord{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Put
         ContentType = "application/json"
         ErrorVariable = "invokeRestMethodError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
         Body = $Payload
     }
 
@@ -593,20 +700,35 @@ function Set-SysAidServiceRecord{
             throw (Get-SysAidErrorMessage -ErrorObject $invokeRestMethodError[0])
         }
     }
+    # There should be nothing viable returned here
+    # return $response
+}
 
-    return $response
+function Add-SysAidServiceRecordNote{
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$True)]
+        [int]$ID,
+
+        [Parameter(Mandatory=$False)]
+        [string]$SubmitUserName,
+
+        [Parameter(Mandatory=$False)]
+        [datetime]$CreateDate = (Get-Date),
+
+        [Parameter(Mandatory=$False)]
+        [string]$Text = ""
+
+
+    )
+    # Create the note object, convert to payload, update service request. 
+    $sysaidnoteObject =  (New-SysAidServiceRequestNote -SubmitUserName $SubmitUserName -CreateDate $CreateDate -Text $Text)
+    Update-SysAidServiceRecord -ID $ID -Payload (New-SysAidServiceRecordPayload -Notes $sysaidnoteObject -ID $ID)
 }
 
 function Add-SysAidServiceRecordLink{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession, 
-
         [Parameter(Mandatory=$True)]
         [int]$ID,
 
@@ -619,7 +741,9 @@ function Add-SysAidServiceRecordLink{
         [uri]$Link
     )
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.AddServiceRequestLink -f $ID))
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break} 
+
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.AddServiceRequestLink -f $ID))
 
     # Prepare the splatting variable
     $invokeWebRequestNewServiceRecordsParameters = @{
@@ -627,7 +751,7 @@ function Add-SysAidServiceRecordLink{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Post
         ContentType = "application/json"
         ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
         Body = '{{"name":"{0}","link":"{1}"}}' -f $LinkName, $link.Uri.AbsoluteUri
     }
 
@@ -639,26 +763,22 @@ function Add-SysAidServiceRecordLink{
             throw (Get-SysAidErrorMessage -ErrorObject $invokeWebRequestError[0])
         }
     }
+
 }
 
 function Search-SysAidUser{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
-
         [Parameter(Mandatory=$True)]
         [string]$Query
     )
 
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
+
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
     $queryParameters.Add("query",$Query)
 
-    $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.SearchUsers)
+    $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.SearchUsers)
     $completeURI.Query = $queryParameters.ToString()
 
     # Prepare the splatting variable
@@ -667,7 +787,7 @@ function Search-SysAidUser{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
         ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
     }
 
     try{
@@ -683,15 +803,8 @@ function Search-SysAidUser{
 }
 
 function Get-SysAidList{
-    [CmdletBinding(DefaultParameterSetName="ID")]
+    [CmdletBinding(DefaultParameterSetName="All")]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
-
         [Parameter(Mandatory=$false)]
         [ValidateSet("sr", "asset", "user", "ci", "company", "action_item", "project", "task", "catalog", "software", "sr_activity", "supplier", "task_activity", "user_groups")]
         [string]$Entity="sr",
@@ -705,12 +818,11 @@ function Get-SysAidList{
         [Parameter(Mandatory=$false)]
         [int]$Limit,
 
-        [Parameter(Mandatory=$True, ParameterSetName="All")]
-        [switch]$All,
-
         [Parameter(Mandatory=$True, ParameterSetName="ID")]
         [string]$ID
     )
+
+    if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
 
     $queryParameters = [System.Web.HttpUtility]::ParseQueryString([String]::Empty) 
     if($Entity){$queryParameters.Add("entity",$Entity.ToString())}
@@ -718,10 +830,11 @@ function Get-SysAidList{
     if($Offset){$queryParameters.Add("offset",$Offset)}
     if($Limit){$queryParameters.Add("limit",$Limit)}
 
+
     if($PSCmdlet.ParameterSetName -eq "All"){
-        $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + $SysAidAPIPaths.GetAllLists)
+        $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + $SysAidAPIPaths.GetAllLists)
     } else {
-        $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.GetList -f $ID))
+        $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.GetList -f $ID))
     }
     $completeURI.Query = $queryParameters.ToString()
     
@@ -731,7 +844,7 @@ function Get-SysAidList{
         Method = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
         ContentType = "application/json"
         ErrorVariable = "invokeWebRequestError"
-        WebSession = $WebSession
+        WebSession = $script:sysAidWebSession 
     }
     
     try{
@@ -748,13 +861,6 @@ function Get-SysAidList{
 function Add-SysAidServiceRequestAttachment{
     [CmdletBinding()]
     param (
-        [Parameter(Position=0, Mandatory=$true)]
-        [string]$TenantURL,
-
-        [Parameter(Position=1, Mandatory=$true)]
-        [Alias("Session")]
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
-
         [Parameter(Mandatory=$True)]
         [string]$ID, 
 
@@ -772,6 +878,7 @@ function Add-SysAidServiceRequestAttachment{
     )
     
     begin{
+        if($null -eq $script:sysAidWebSession){Write-Error "No active WebSession to SysAid. Call the cmdlet Set-SysAidAPIWebSession first.";break}
         
         # Set an automated Content Type if one is not specified. If it cannot be determined assume application/octet-stream
         if($PSCmdlet.ParameterSetName -eq "File"){
@@ -796,7 +903,7 @@ function Add-SysAidServiceRequestAttachment{
 
         $httpClientHandler = [System.Net.Http.HttpClientHandler]::new()
         # Add the cookie from the existing web session
-        $httpClientHandler.CookieContainer.Add($WebSession.Cookies.GetCookies($tenantURL))
+        $httpClientHandler.CookieContainer.Add($script:sysAidWebSession.Cookies.GetCookies($tenantURL))
         $httpClient = [System.Net.Http.Httpclient]::new($httpClientHandler)
 
         $contentDispositionHeaderValue = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new("form-data")
@@ -827,7 +934,7 @@ function Add-SysAidServiceRequestAttachment{
         $content.Add($streamContent)
 
         try{
-            $completeURI = [System.UriBuilder]($TenantURL + $SysAidAPIPaths.root + ($SysAidAPIPaths.AddServiceRequestAttachment -f $ID))
+            $completeURI = [System.UriBuilder]($script:SysAidTenantUrl+ $SysAidAPIPaths.root + ($SysAidAPIPaths.AddServiceRequestAttachment -f $ID))
             $response = $httpClient.PostAsync($completeURI.Uri, $content).Result
 
             if (!$response.IsSuccessStatusCode){
